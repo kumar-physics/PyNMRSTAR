@@ -5,5 +5,8 @@ python:
   - "3.3"
   - "3.4"
   - "3.5"
+  - "3.5-dev"
+  - "nightly"
 # command to run tests
 script: ./bmrb.py
+install: cd c; make; cd ..

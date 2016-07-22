@@ -3,6 +3,21 @@ A Python module for reading, writing, and manipulating NMR-STAR files. [![Build 
 
 Python versions supported: 2.6, 2.7, 3.3, 3.4, and 3.5
 
+### Want it faster?
+
+Now there is a C extension that makes parsing and printing in NMR-STAR
+format significantly faster. Simply
+
+```bash
+cd c
+make
+cd ..
+```
+
+and then use the library like normal to start taking advantage of the
+speed up! If you don't compile the C extension the module will use
+automatically use pure python implementations instead.
+
 ====
 
 This module provides Entry, Saveframe, and Loop objects. Use python's
@@ -163,11 +178,10 @@ attempt to open the file.
 
 Create an entry from JSON (serialized or unserialized JSON).
 
-#### def `from_scratch(cls, bmrb_id)`
+#### def `from_scratch(cls, entry_id)`
 
 Create an empty entry that you can programatically add to.
-You must pass a number corresponding to the BMRB ID. If this
-is not a "real" BMRB entry, use 0 as the BMRB ID.
+You must pass a value corresponding to the Entry ID.
 
 #### def `from_string(cls, the_string)`
 

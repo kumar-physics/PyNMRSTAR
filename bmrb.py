@@ -98,6 +98,25 @@ else:
     from cStringIO import StringIO
     BytesIO = StringIO
 
+# See if we can use the fast tokenizer
+try:
+    import cnmrstar
+except ImportError:
+    cnmrstar = None
+
+# See if we can import from_iterable
+try:
+    from itertools import chain as _chain
+    _from_iterable = _chain.from_iterable
+except ImportError:
+    def _from_iterable(iterables):
+        """ A simple implementation of chain.from_iterable.
+        As such: _from_iterable(['ABC', 'DEF']) --> A B C D E F """
+
+        for item in iterables:
+            for element in item:
+                yield element
+
 #############################################
 #            Global Variables               #
 #############################################
@@ -121,10 +140,11 @@ CONVERT_DATATYPES = False
 STR_CONVERSION_DICT = {None:"."}
 
 # Used internally
-STANDARD_SCHEMA = None
-COMMENT_DICTIONARY = {}
-API_URL = "http://webapi.bmrb.wisc.edu/current"
-SCHEMA_URL = 'http://svn.bmrb.wisc.edu/svn/nmr-star-dictionary/bmrb_only_files/adit_input/xlschem_ann.csv'
+_STANDARD_SCHEMA = None
+_COMMENT_DICTIONARY = {}
+_API_URL = "http://webapi.bmrb.wisc.edu/current"
+_SCHEMA_URL = 'http://svn.bmrb.wisc.edu/svn/nmr-star-dictionary/bmrb_only_files/adit_input/xlschem_ann.csv'
+_WHITESPACE = " \t\n\v"
 
 #############################################
 #             Module methods                #
@@ -162,10 +182,10 @@ def diff(entry1, entry2):
     for difference in diffs:
         print(difference)
 
-def validate(entry_to_validate, validation_schema=None):
+def validate(entry_to_validate, schema=None):
     """Prints a validation report of an entry."""
 
-    validation = entry_to_validate.validate(validation_schema)
+    validation = entry_to_validate.validate(schema)
     if len(validation) == 0:
         print("No problems found during validation.")
     for err in validation:
@@ -193,10 +213,16 @@ def clean_value(value):
     # Allow manual specification of conversions for booleans, Nones, etc.
     if value in STR_CONVERSION_DICT:
         if any(isinstance(value, type(x)) for x in STR_CONVERSION_DICT):
-        # The additional check prevents numerical types from being
-        # interpreted as booleans. This is PROVIDED the dictionary
-        # does not contain both numericals and booleans
             value = STR_CONVERSION_DICT[value]
+
+    # Use the fast code if it is available
+    if cnmrstar != None:
+        # It's faster to assume we are working with a string and catch
+        #  errors than to check the instance for every object and convert
+        try:
+            return cnmrstar.clean_value(value)
+        except (ValueError, TypeError):
+            return cnmrstar.clean_value(str(value))
 
     # Convert non-string types to string
     if not isinstance(value, str):
@@ -221,7 +247,7 @@ def clean_value(value):
         for pos, char in enumerate(value):
             next_char = value[pos+1:pos+2]
 
-            if next_char != "" and next_char in " \t\n\v":
+            if next_char != "" and next_char in _WHITESPACE:
                 if char == "'":
                     can_wrap_single = False
                 if char == '"':
@@ -282,33 +308,25 @@ def _format_tag(value):
         value = value[value.index('.')+1:]
     return value
 
-def _from_iterable(iterables):
-    """ A simple implementation of chain.from_iterable.
-    As such: _from_iterable(['ABC', 'DEF']) --> A B C D E F """
-
-    for item in iterables:
-        for element in item:
-            yield element
-
 def _get_schema(passed_schema=None):
     """If passed a schema (not None) it returns it. If passed none,
     it checks if the default schema has been initialized. If not
     initialzed, it initializes it. Then it returns the default schema."""
 
-    global STANDARD_SCHEMA
+    global _STANDARD_SCHEMA
     if passed_schema is None:
-        passed_schema = STANDARD_SCHEMA
+        passed_schema = _STANDARD_SCHEMA
     if passed_schema is None:
         # If we fail to get the schema don't do anything
         try:
-            STANDARD_SCHEMA = Schema()
+            _STANDARD_SCHEMA = Schema()
         except HTTPError:
             try:
-                STANDARD_SCHEMA = Schema(schema_file="reference_files/schema")
+                _STANDARD_SCHEMA = Schema(schema_file="reference_files/schema")
             except:
                 raise ValueError("Could not load a BMRB schema from the "
                                  "internet or from the local repository.")
-        passed_schema = STANDARD_SCHEMA
+        passed_schema = _STANDARD_SCHEMA
 
     return passed_schema
 
@@ -369,7 +387,17 @@ def _load_comments(file_to_load=None):
     for pos, val in enumerate(categories):
         comment = comments[pos]
         if comment != ".":
-            COMMENT_DICTIONARY[val] = comments[pos].rstrip() + "\n\n"
+            _COMMENT_DICTIONARY[val] = comments[pos].rstrip() + "\n\n"
+
+def _tag_key(x, schema=None):
+    """ Helper function to figure out how to sort the tags."""
+    try:
+        return _get_schema(schema).schema_order.index(x)
+    except ValueError:
+        # Generate an arbitrary sort order for tags that aren't in the
+        #  schema but make sure that they always come after tags in the
+        #   schema
+        return len(_get_schema(schema).schema_order) + hash(x)
 
 #############################################
 #                Classes                    #
@@ -391,24 +419,41 @@ class _Parser(object):
         self.index = 0
         self.token = ""
         self.source = "unknown"
-        self.last_delineator = ""
+        self.last_delineator = " "
 
     def get_line_number(self):
         """ Returns the current line number that is in the process of
         being parsed."""
 
-        return self.full_data[0:self.index].count("\n")+1
+        if cnmrstar != None:
+            return cnmrstar.get_line_number()
+        else:
+            return self.full_data[0:self.index].count("\n")+1
+
+    def get_delineator(self):
+        """ Returns the delineator for the last token."""
+
+        if cnmrstar != None:
+            return cnmrstar.get_last_delineator()
+        else:
+            return self.last_delineator
 
     def get_token(self):
         """ Returns the next token in the parsing process."""
 
-        self.real_get_token()
+        if cnmrstar is not None:
+            self.token = cnmrstar.get_token()
+        else:
+            self.real_get_token()
+
         # This is just too VERBOSE
         if VERBOSE == "very":
             if self.token:
                 print("'" + self.token + "'")
             else:
                 print("No more tokens.")
+
+        # Return the token
         return self.token
 
     @staticmethod
@@ -417,8 +462,7 @@ class _Parser(object):
         None instead."""
 
         try:
-            pos = haystack.index(needle, startpos)
-            return pos
+            return haystack.index(needle, startpos)
         except ValueError:
             return None
 
@@ -428,9 +472,8 @@ class _Parser(object):
         provided string. If no whitespace it returns the length of the
         string."""
 
-        whitespace = " \t\n\v"
         for pos, char in enumerate(data):
-            if char in whitespace:
+            if char in _WHITESPACE:
                 return pos
         return len(data)
 
@@ -438,8 +481,13 @@ class _Parser(object):
         """ Parses the string provided as data as an NMR-STAR entry
         and returns the parsed entry. Raises ValueError on exceptions."""
 
-        # Fix DOS line endings
-        self.full_data = data.replace("\r\n", "\n").replace("\r", "\n") + "\n"
+        data = data.replace("\r\n", "\n").replace("\r", "\n")
+
+        if cnmrstar != None:
+            cnmrstar.load_string(data)
+        else:
+            # Fix DOS line endings
+            self.full_data = data + "\n"
 
         # Create the NMRSTAR object
         curframe = None
@@ -461,12 +509,12 @@ class _Parser(object):
             raise ValueError("'data_' must be followed by data name. Simply "
                              "'data_' is not allowed.", self.get_line_number())
 
-        if self.last_delineator != "":
+        if self.get_delineator() != " ":
             raise ValueError("The data_ keyword may not be quoted or "
                              "semicolon-delineated.")
 
-        # Set the bmrb_id
-        self.ent.bmrb_id = self.token[5:]
+        # Set the entry_id
+        self.ent.entry_id = self.token[5:]
         self.source = source
 
         # We are expecting to get saveframes
@@ -483,7 +531,7 @@ class _Parser(object):
                                  "without a specified saveframe name.",
                                  self.get_line_number())
 
-            if self.last_delineator != "":
+            if self.get_delineator() != " ":
                 raise ValueError("The save_ keyword may not be quoted or "
                                  "semicolon-delineated.",
                                  self.get_line_number())
@@ -496,7 +544,7 @@ class _Parser(object):
             while self.get_token() != None:
 
                 if self.token == "loop_":
-                    if self.last_delineator != "":
+                    if self.get_delineator() != " ":
                         raise ValueError("The loop_ keyword may not be quoted "
                                          "or semicolon-delineated.",
                                          self.get_line_number())
@@ -511,7 +559,7 @@ class _Parser(object):
 
                         # Add a column
                         if self.token.startswith("_"):
-                            if self.last_delineator != "":
+                            if self.get_delineator() != " ":
                                 raise ValueError("Loop tags may not be quoted "
                                                  "or semicolon-delineated.",
                                                  self.get_line_number())
@@ -526,7 +574,7 @@ class _Parser(object):
                             # We are in the data block of a loop
                             while self.token != None:
                                 if self.token == "stop_":
-                                    if self.last_delineator != "":
+                                    if self.get_delineator() != " ":
                                         raise ValueError("The stop_ keyword may"
                                                          " not be quoted or "
                                                          "semicolon-delineated.",
@@ -545,8 +593,9 @@ class _Parser(object):
                                         raise ValueError("Loop with no data.",
                                                          self.get_line_number())
                                     else:
-                                        curloop.add_data(curdata,
-                                                         rearrange=True)
+                                        if len(curdata) > 0:
+                                            curloop.add_data(curdata,
+                                                             rearrange=True)
                                         curloop = None
                                         curdata = []
 
@@ -560,7 +609,7 @@ class _Parser(object):
                                                          self.get_line_number())
 
                                     if (self.token in self.reserved and
-                                            self.last_delineator == ""):
+                                            self.get_delineator() == " "):
                                         raise ValueError("Cannot use keywords "
                                                          "as data values unless"
                                                          " quoted or semi-colon"
@@ -582,7 +631,7 @@ class _Parser(object):
 
                 # Close saveframe
                 elif self.token == "save_":
-                    if self.last_delineator != "":
+                    if self.get_delineator() not in " ;":
                         raise ValueError("The save_ keyword may not be quoted "
                                          "or semicolon-delineated.",
                                          self.get_line_number())
@@ -607,7 +656,7 @@ class _Parser(object):
 
                 # Add a tag
                 else:
-                    if self.last_delineator != "":
+                    if self.get_delineator() != " ":
                         raise ValueError("Saveframe tags may not be quoted or "
                                          "semicolon-delineated.",
                                          self.get_line_number())
@@ -616,7 +665,7 @@ class _Parser(object):
                     # We are in a saveframe and waiting for the saveframe tag
                     self.get_token()
                     if (self.token in self.reserved and
-                            self.last_delineator == ""):
+                            self.get_delineator() == " "):
                         raise ValueError("Cannot use keywords as data values "
                                          "unless quoted or semi-colon "
                                          "delineated. Illegal value: " +
@@ -637,7 +686,7 @@ class _Parser(object):
         is just a wrapper around this with some exception handling."""
 
         # Reset the delineator
-        self.last_delineator = ""
+        self.last_delineator = " "
 
         # Nothing left
         if self.token is None:
@@ -659,7 +708,7 @@ class _Parser(object):
                 raw_tmp = self.full_data[self.index:newline_index]
             except ValueError:
                 # End of file
-                self.token = self.full_data[self.index:].lstrip(" \t\n\v")
+                self.token = self.full_data[self.index:].lstrip(_WHITESPACE)
                 if self.token == "":
                     self.token = None
                 self.index = len(self.full_data)
@@ -667,7 +716,7 @@ class _Parser(object):
 
             newline_index = self.full_data.index("\n", self.index+1)
             raw_tmp = self.full_data[self.index:newline_index+1]
-            tmp = raw_tmp.lstrip(" \t\n\v")
+            tmp = raw_tmp.lstrip(_WHITESPACE)
 
         # If it is a multiline comment, recalculate our viewing window
         if tmp[0:2] == ";\n":
@@ -744,7 +793,7 @@ class _Parser(object):
             # Make sure we don't stop for quotes that are not followed
             #  by whitespace
             try:
-                while tmp[until+1:until+2] not in " \t\n":
+                while tmp[until+1:until+2] not in _WHITESPACE:
                     until = self.index_handle(tmp, "'", until+1)
             except TypeError:
                 raise ValueError("Invalid file. Single quoted value was never "
@@ -766,7 +815,7 @@ class _Parser(object):
             # Make sure we don't stop for quotes that are not followed
             #  by whitespace
             try:
-                while tmp[until+1:until+2] not in " \t\n":
+                while tmp[until+1:until+2] not in _WHITESPACE:
                     until = self.index_handle(tmp, '"', until+1)
             except TypeError:
                 raise ValueError("Invalid file. Double quoted value was never "
@@ -802,9 +851,10 @@ class Schema(object):
         self.headers = []
         self.schema = {}
         self.types = {}
+        self.category_order = []
 
         if schema_file is None:
-            schema_file = SCHEMA_URL
+            schema_file = _SCHEMA_URL
         self.schema_file = schema_file
 
         schem_stream = _interpret_file(schema_file)
@@ -834,6 +884,11 @@ class Schema(object):
                                                 line[1], line[8])
                 self.types[line[8][:line[8].index(".")]] = (line[1], line[42])
                 self.schema_order.append(line[8])
+
+                # Store just the categories as well
+                formatted = _format_category(line[8])
+                if formatted not in self.category_order:
+                    self.category_order.append(formatted)
             else:
                 if VERBOSE:
                     print("Detected invalid tag in schema: %s" % line)
@@ -987,6 +1042,11 @@ class Entry(object):
 
         return len(self.compare(other)) == 0
 
+    def __ne__(self, other):
+        """It isn't enough to define __eq__ in python2.x."""
+
+        return not self.__eq__(other)
+
     def __getitem__(self, item):
         """Get the indicated saveframe."""
 
@@ -1000,13 +1060,13 @@ class Entry(object):
         from_string, or from_database to construct."""
 
         # Default initializations
-        self.bmrb_id = 0
+        self.entry_id = 0
         self.frame_list = []
         self.source = None
 
         # They initialized us wrong
         if len(kargs) == 0:
-            raise ValueError("You must provide either a BMRB ID, a file name, "
+            raise ValueError("You must provide either a Entry ID, a file name, "
                              "an entry number, or a string to initialize. Use "
                              "the class methods.")
         elif len(kargs) > 1:
@@ -1042,7 +1102,7 @@ class Entry(object):
                               "database." % entry_number)
         else:
             # Initialize a blank entry
-            self.bmrb_id = kargs['bmrb_id']
+            self.entry_id = kargs['entry_id']
             self.source = "from_scratch()"
             return
 
@@ -1058,12 +1118,12 @@ class Entry(object):
     def __lt__(self, other):
         """Returns true if this entry is less than another entry."""
 
-        return self.bmrb_id > other.bmrb_id
+        return self.entry_id > other.entry_id
 
     def __repr__(self):
         """Returns a description of the entry."""
 
-        return "<bmrb.Entry '%s' %s>" % (self.bmrb_id, self.source)
+        return "<bmrb.Entry '%s' %s>" % (self.entry_id, self.source)
 
     def __setitem__(self, key, item):
         """Set the indicated saveframe."""
@@ -1083,7 +1143,7 @@ class Entry(object):
                 else:
                     raise KeyError("Saveframe with name '%s' does not exist "
                                    "and therefore cannot be written to. Use "
-                                   "the addSaveframe method to add new "
+                                   "the add_saveframe method to add new "
                                    "saveframes." % key)
         else:
             raise ValueError("You can only assign an entry to a saveframe"
@@ -1092,9 +1152,8 @@ class Entry(object):
     def __str__(self):
         """Returns the entire entry in STAR format as a string."""
 
-        ret_string = "data_%s\n\n" % self.bmrb_id
-        for frame in self.frame_list:
-            ret_string += str(frame) + "\n"
+        ret_string = ("data_%s\n\n" % self.entry_id +
+                      "\n".join([str(frame) for frame in self.frame_list]))
         return ret_string
 
     @classmethod
@@ -1105,7 +1164,7 @@ class Entry(object):
 
         # Try to load the entry using JSON
         try:
-            entry_url = API_URL + "/rest/entry/%s/"
+            entry_url = _API_URL + "/rest/entry/%s/"
             entry_url = entry_url % entry_num
 
             # Convert bytes to string if python3
@@ -1183,14 +1242,24 @@ class Entry(object):
                                  "dictionary nor a JSON string.")
 
         # Make sure it has the correct keys
-        for check in ["bmrb_id", "saveframes"]:
-            if check not in json_dict:
-                raise ValueError("The JSON you provide must be a hash and must"
-                                 " contain the key '%s' - even if the key "
-                                 "points to 'None'." % check)
+        if "saveframes" not in json_dict:
+            raise ValueError("The JSON you provide must be a hash and must"
+                             " contain the key 'saveframes' - even if the key "
+                             "points to 'None'.")
+
+        if "entry_id" not in json_dict and "bmrb_id" not in json_dict:
+            raise ValueError("The JSON you provide must be a hash and must"
+                             " contain the key 'entry_id' - even if the key "
+                             "points to 'None'.")
+
+
+        # Until the migration is complete, 'bmrb_id' is a synonym for
+        #  'entry_id'
+        if 'entry_id' not in json_dict:
+            json_dict['entry_id'] = json_dict['bmrb_id']
 
         # Create an entry from scratch and populate it
-        ret = Entry.from_scratch(json_dict['bmrb_id'])
+        ret = Entry.from_scratch(json_dict['entry_id'])
         ret.frame_list = [Saveframe.from_json(x) for x in
                           json_dict['saveframes']]
         ret.source = "from_json()"
@@ -1205,12 +1274,12 @@ class Entry(object):
         return cls(the_string=the_string)
 
     @classmethod
-    def from_scratch(cls, bmrb_id):
+    def from_scratch(cls, entry_id):
         """Create an empty entry that you can programatically add to.
-        You must pass a number corresponding to the BMRB ID. If this
-        is not a "real" BMRB entry, use 0 as the BMRB ID."""
+        You must pass a value corresponding to the Entry ID.
+        (The unique identifier "xxx" from "data_xxx".)"""
 
-        return cls(bmrb_id=bmrb_id)
+        return cls(entry_id=entry_id)
 
     def add_saveframe(self, frame):
         """Add a saveframe to the entry."""
@@ -1236,9 +1305,9 @@ class Entry(object):
             else:
                 return ['String was not exactly equal to entry.']
         try:
-            if str(self.bmrb_id) != str(other.bmrb_id):
-                diffs.append("BMRB ID does not match between entries: "
-                             "'%s' vs '%s'." % (self.bmrb_id, other.bmrb_id))
+            if str(self.entry_id) != str(other.entry_id):
+                diffs.append("Entry ID does not match between entries: "
+                             "'%s' vs '%s'." % (self.entry_id, other.entry_id))
             if len(self.frame_list) != len(other.frame_list):
                 diffs.append("The number of saveframes in the entries are not"
                              " equal: '%d' vs '%d'." %
@@ -1271,8 +1340,11 @@ class Entry(object):
         serializeable is returned."""
 
         frames = [x.get_json(serialize=False) for x in self.frame_list]
+
+        # Store the "bmrb_id" as well to prevent old code from breaking
         entry_dict = {
-            "bmrb_id": self.bmrb_id,
+            "entry_id": self.entry_id,
+            "bmrb_id": self.entry_id,
             "saveframes": frames
         }
 
@@ -1349,6 +1421,51 @@ class Entry(object):
 
         return results
 
+    def normalize(self, schema=None):
+        """ Sorts saveframes, loops, and tags according to the schema
+        provided (or BMRB default if none provided) and according
+        to the assigned ID."""
+
+        # The saveframe/loop order
+        ordering = _get_schema(schema).category_order
+        # Use these to sort saveframes and loops
+        def sf_key(x):
+            """ Helper function to sort the saveframes."""
+
+            try:
+                return (ordering.index(x.tag_prefix), x.get_tag("ID"))
+            except ValueError:
+                # Generate an arbitrary sort order for saveframes that aren't
+                #  in the schema but make sure that they always come after
+                #   saveframes in the schema
+                return (len(ordering) + hash(x), x.get_tag("ID"))
+
+        def loop_key(x):
+            """ Helper function to sort the loops."""
+
+            try:
+                return ordering.index(x.category)
+            except ValueError:
+                # Generate an arbitrary sort order for loops that aren't in the
+                #  schema but make sure that they always come after loops in the
+                #   schema
+                return len(ordering) + hash(x)
+
+        # Go through all the saveframes
+        for each_frame in self:
+            each_frame.sort_tags()
+            # Iterate through the loops
+            for each_loop in each_frame:
+                each_loop.sort_tags()
+
+                # See if we can sort the rows (in addition to columns)
+                try:
+                    each_loop.sort_rows("Ordinal")
+                except ValueError:
+                    pass
+            each_frame.loops.sort(key=loop_key)
+        self.frame_list.sort(key=sf_key)
+
     def nef_string(self):
         """ Returns a string representation of the entry in NEF. """
 
@@ -1366,6 +1483,56 @@ class Entry(object):
         DONT_SHOW_COMMENTS = tmp_dont_show_comments
         return result
 
+    def rename_saveframe(self, original_name, new_name):
+        """ Renames a saveframe and updates all pointers to that
+        saveframe in the entry with the new name."""
+
+        # Strip off the starting $ in the names
+        if original_name.startswith("$"):
+            original_name = original_name[1:]
+        if new_name.startswith("$"):
+            new_name = new_name[1:]
+
+        # Make sure there is no saveframe called what
+        #  the new name is
+        if [x.name for x in self.frame_list].count(new_name) > 0:
+            raise ValueError("Cannot rename a saveframe as '%s' because a "
+                             "saveframe with the name already exists." %
+                             new_name)
+
+        # This can raise a ValueError, but no point catching it
+        #  since it really is a ValueError if they provide a name
+        #   of a saveframe that doesn't exist in the entry.
+        change_frame = self.get_saveframe_by_name(original_name)
+
+        # Make sure the new saveframe name is valid
+        for char in new_name:
+            if char in _WHITESPACE:
+                raise ValueError("You cannot have whitespace characters in a "
+                                 "saveframe name. Illegal character: '%s'" %
+                                 char)
+
+        # Update the saveframe
+        change_frame['Sf_framecode'] = new_name
+        change_frame.name = new_name
+
+        # What the new references should look like
+        old_reference = "$" + original_name
+        new_reference = "$" + new_name
+
+        # Go through all the saveframes
+        for each_frame in self:
+            # Iterate through the tags
+            for each_tag in each_frame.tags:
+                if each_tag[1] == old_reference:
+                    each_tag[1] = new_reference
+            # Iterate through the loops
+            for each_loop in each_frame:
+                for each_row in each_loop:
+                    for pos, val in enumerate(each_row):
+                        if val == old_reference:
+                            each_row[pos] = new_reference
+
     def print_tree(self):
         """Prints a summary, tree style, of the frames and loops in
         the entry."""
@@ -1376,24 +1543,63 @@ class Entry(object):
             for pos2, one_loop in enumerate(frame):
                 print("\t\t[%d] %s" % (pos2, repr(one_loop)))
 
-    def validate(self, validation_schema=None):
-        """Validate an entry against a STAR schema. You can pass your
-        own custom schema if desired, otherwise the schema will be
-        fetched from the BMRB servers. Returns a list of errors found.
-        0-length list indicates no errors found."""
+    def validate(self, validate_schema=True, schema=None,
+                 validate_star=True):
+        """Validate an entry in a variety of ways. Returns a list of
+        errors found. 0-length list indicates no errors found. By
+        default all validation modes are enabled.
+
+        validate_schema - Determines if the entry is validated against
+        the NMR-STAR schema. You can pass your own custom schema if desired,
+        otherwise the schema will be fetched from the BMRB servers.
+
+        validate_star - Determines if the STAR syntax checks are ran."""
 
         errors = []
 
+        # They should validate for something...
+        if not validate_star and not validate_schema:
+            errors.append("Validate() should be called with at least one "
+                          "validation method enabled.")
+
+        if validate_star:
+
+            # Check for saveframes with same name
+            saveframe_names = sorted(x.name for x in self)
+            for ordinal in range(0, len(saveframe_names)-2):
+                if saveframe_names[ordinal] == saveframe_names[ordinal+1]:
+                    errors.append("Multiple saveframes with same name: '%s'" %
+                                  saveframe_names[ordinal])
+
+            # Check for dangling references
+            fdict = self.frame_dict()
+
+            for each_frame in self:
+                # Iterate through the tags
+                for each_tag in each_frame.tags:
+                    if (each_tag[1].startswith("$")
+                            and each_tag[1][1:] not in fdict):
+                        errors.append("Dangling saveframe reference '%s' in "
+                                      "tag '%s.%s'" % (each_tag[1],
+                                                       each_frame.tag_prefix,
+                                                       each_tag[0]))
+
+                # Iterate through the loops
+                for each_loop in each_frame:
+                    for each_row in each_loop:
+                        for pos, val in enumerate(each_row):
+                            if val.startswith("$") and val[1:] not in fdict:
+                                errors.append("Dangling saveframe reference "
+                                              "'%s' in tag '%s.%s'" %
+                                              (val,
+                                               each_loop.category,
+                                               each_loop.columns[pos]))
+
         # Ask the saveframes to check themselves for errors
         for frame in self:
-            errors.extend(frame.validate(validation_schema=validation_schema))
-
-        # Check for saveframes with same name
-        saveframe_names = sorted(x.name for x in self)
-        for ordinal in range(0, len(saveframe_names)-2):
-            if saveframe_names[ordinal] == saveframe_names[ordinal+1]:
-                errors.append("Multiple saveframes with same name: " +
-                              saveframe_names[ordinal])
+            errors.extend(frame.validate(validate_schema=validate_schema,
+                                         schema=schema,
+                                         validate_star=validate_star))
 
         return errors
 
@@ -1424,6 +1630,11 @@ class Saveframe(object):
         False if it is equal."""
 
         return len(self.compare(other)) == 0
+
+    def __ne__(self, other):
+        """It isn't enough to define __eq__ in python2.x."""
+
+        return not self.__eq__(other)
 
     def __getitem__(self, item):
         """Get the indicated loop or tag."""
@@ -1594,7 +1805,7 @@ class Saveframe(object):
                 else:
                     raise KeyError("Loop with category '%s' does not exist and"
                                    " therefore cannot be written to. Use "
-                                   "addLoop instead." % key)
+                                   "add_loop instead." % key)
         else:
             # If the tag already exists, set its value
             self.add_tag(key, item, update=True)
@@ -1630,8 +1841,8 @@ class Saveframe(object):
                 except IndexError:
                     our_category = None
 
-            if our_category in COMMENT_DICTIONARY:
-                ret_string = COMMENT_DICTIONARY[our_category]
+            if our_category in _COMMENT_DICTIONARY:
+                ret_string = _COMMENT_DICTIONARY[our_category]
 
         # Print the saveframe
         ret_string += "save_%s\n" % self.name
@@ -1648,7 +1859,7 @@ class Saveframe(object):
                 else:
                     ret_string += pstring % (each_tag[0], clean_tag)
             else:
-                formatted_tag = self.tag_prefix+"."+each_tag[0]
+                formatted_tag = self.tag_prefix + "." + each_tag[0]
                 if "\n" in clean_tag:
                     ret_string += mstring % (formatted_tag, clean_tag)
                 else:
@@ -1948,28 +2159,14 @@ class Saveframe(object):
 
         self.tag_prefix = _format_category(tag_prefix)
 
-    def sort_tags(self, validation_schema=None):
+    def sort_tags(self, schema=None):
         """ Sort the tags so they are in the same order as a BMRB
         schema. Will automatically use the standard schema if none
         is provided."""
 
-        new_tag_list = []
-        lower_tag_prefix = self.tag_prefix.lower()
-
-        for check in _get_schema(validation_schema).schema_order:
-            # Only proceed if it has the same category as us
-            if _format_category(check).lower() == lower_tag_prefix:
-                tag_name = _format_tag(check)
-                # If we currently have the tag, add it to the new tag list
-                existing = self.get_tag(tag_name, whole_tag=True)
-                if existing != []:
-                    new_tag_list.extend(existing)
-
-        if len(self.tags) != len(new_tag_list):
-            raise ValueError("Refusing to sort. There are tags in the "
-                             "saveframe that do not exist in the schema.")
-
-        self.tags = new_tag_list
+        mod_key = lambda x: _tag_key(self.tag_prefix + "." + x[0],
+                                     schema=schema)
+        self.tags.sort(key=mod_key)
 
     def tag_iterator(self):
         """Returns an iterator for saveframe tags."""
@@ -1983,14 +2180,17 @@ class Saveframe(object):
         for pos, each_loop in enumerate(self):
             print("\t[%d] %s" % (pos, repr(each_loop)))
 
-    def validate(self, validation_schema=None):
-        """Validate a saveframe against a STAR schema. You can pass your
-        own custom schema if desired, otherwise the schema will be
-        fetched from the BMRB servers. Returns a list of errors found.
-        0-length list indicates no errors found."""
+    def validate(self, validate_schema=True, schema=None,
+                 validate_star=True):
+        """Validate a saveframe in a variety of ways. Returns a list of
+        errors found. 0-length list indicates no errors found. By
+        default all validation modes are enabled.
 
-        # Get the default schema if we are not passed a schema
-        my_schema = _get_schema(validation_schema)
+        validate_schema - Determines if the entry is validated against
+        the NMR-STAR schema. You can pass your own custom schema if desired,
+        otherwise the schema will be fetched from the BMRB servers.
+
+        validate_star - Determines if the STAR syntax checks are ran."""
 
         errors = []
 
@@ -2001,18 +2201,25 @@ class Saveframe(object):
                           "'. No saveframe category defined.")
             my_category = None
 
-        for tag in self.tags:
-            lineno = str(tag[2]) + " of original file" if len(tag) > 2 else None
-            formatted_tag = self.tag_prefix + "." + tag[0]
-            cur_errors = my_schema.val_type(formatted_tag, tag[1],
-                                            category=my_category,
-                                            linenum=lineno)
-            errors.extend(cur_errors)
+        if validate_schema:
+            # Get the default schema if we are not passed a schema
+            my_schema = _get_schema(schema)
 
+            for tag in self.tags:
+                lineno = str(tag[2]) + " of original file" if len(tag) > 2 else None
+                formatted_tag = self.tag_prefix + "." + tag[0]
+                cur_errors = my_schema.val_type(formatted_tag, tag[1],
+                                                category=my_category,
+                                                linenum=lineno)
+                errors.extend(cur_errors)
+
+        # Check the loops for errors
         for each_loop in self.loops:
             errors.extend(
-                each_loop.validate(
-                    validation_schema=validation_schema, category=my_category))
+                each_loop.validate(validate_schema=validate_schema,
+                                   schema=schema,
+                                   validate_star=validate_star,
+                                   category=my_category))
 
         return errors
 
@@ -2024,6 +2231,11 @@ class Loop(object):
         it is different."""
 
         return len(self.compare(other)) == 0
+
+    def __ne__(self, other):
+        """It isn't enough to define __eq__ in python2.x."""
+
+        return not self.__eq__(other)
 
     def __getitem__(self, item):
         """Get the indicated row from the data array."""
@@ -2119,6 +2331,33 @@ class Loop(object):
         else:
             return "<bmrb.Loop '%s'>" % self.category
 
+    def __setitem__(self, key, item):
+        """Set all of the instances of a tag to the provided value.
+        If there are 5 rows of data in the loop, you will need to
+        assign a list with 5 elements."""
+
+        tag = _format_tag(key)
+
+        # Check that their tag is in the loop
+        if tag not in self.columns:
+            raise ValueError("Cannot assign to tag '%s' as it does not exist "
+                             "in this loop." % key)
+
+        # Determine where to assign
+        column = self.columns.index(tag)
+
+        # Make sure they provide a list of the correct length
+        if len(self[key]) != len(item):
+            raise ValueError("To assign to a tag you must provide a list (or "
+                             "iterable) of a length equal to the number of "
+                             "values that currently exist for that tag. The tag"
+                             " '%s' current has %d values and you supplied "
+                             "%d values." % (key, len(self[key]), len(item)))
+
+        # Do the assignment
+        for pos, row in enumerate(self.data):
+            row[column] = item[pos]
+
     def __str__(self):
         """Returns the loop in STAR format as a string."""
 
@@ -2156,7 +2395,7 @@ class Loop(object):
             raise ValueError("The category was never set for this loop. Either "
                              "add a column with the category intact, specify it"
                              " when generating the loop, or set it using "
-                             "setCategory.")
+                             "set_category.")
 
         # Print the categories
         if self.category is None:
@@ -2167,6 +2406,8 @@ class Loop(object):
                 ret_string += pstring % (self.category + "." + column)
 
         ret_string += "\n"
+
+        row_strings = []
 
         if len(self.data) != 0:
 
@@ -2191,12 +2432,12 @@ class Loop(object):
                     if "\n" in item:
                         datum[pos] = "\n;\n%s;\n" % item
 
-                # Print the data (combine the columns widths with their data)
+                # Print the data (combine the column's widths with their data)
                 column_width_list = [d for d in zip(title_widths, datum)]
-                ret_string += pstring % tuple(_from_iterable(column_width_list))
+                row_strings.append(pstring % tuple(_from_iterable(column_width_list)))
 
         # Close the loop
-        ret_string += "   stop_\n"
+        ret_string += "".join(row_strings) + "   stop_\n"
         return ret_string
 
     @classmethod
@@ -2411,10 +2652,8 @@ class Loop(object):
                 if self.data != other.data:
 
                     # Check data of loops
-                    self_data = sorted(deepcopy(self.data),
-                                       key=lambda x: tuple(x))
-                    other_data = sorted(deepcopy(other.data),
-                                        key=lambda x: tuple(x))
+                    self_data = sorted(deepcopy(self.data))
+                    other_data = sorted(deepcopy(other.data))
 
                     if self_data != other_data:
                         diffs.append("\t\tLoop data does not match for loop "
@@ -2501,7 +2740,7 @@ class Loop(object):
         return csv_buffer.read().replace('\r\n', '\n')
 
     def get_data_by_tag(self, tags=None):
-        """ Identical to getTag but wraps the results in a list even if
+        """ Identical to get_tag but wraps the results in a list even if
         only fetching one tag. Primarily exists for legacy code."""
 
         results = self.get_tag(tags=tags)
@@ -2666,12 +2905,29 @@ class Loop(object):
 
         self.category = _format_category(category)
 
+    def sort_tags(self, schema=None):
+        """ Rearranges the columns and data in the loop to match the order
+        from the schema. Uses the BMRB schema unless one is provided."""
+
+        current_order = self.get_columns()
+
+        # Sort the tags
+        loc_key = lambda x: _tag_key(x, schema=schema)
+        sorted_order = sorted(current_order, key=loc_key)
+
+        # Don't touch the data if the tags are already in order
+        if sorted_order == current_order:
+            return
+        else:
+            self.data = self.get_tag(sorted_order)
+            self.columns = [_format_tag(x) for x in sorted_order]
+
     def sort_rows(self, tags, key=None):
         """ Sort the data in the rows by their values for a given column
         or columns. Specify the columns using their names or ordinals.
         Accepts a list or an int/float. By default we will sort
         numerically. If that fails we do a string sort. Supply a
-        function as key_func and we will order the elements based on the
+        function as key and we will order the elements based on the
         keys it provides. See the help for sorted() for more details. If
         you provide multiple columns to sort by, they are interpreted as
         increasing order of sort priority."""
@@ -2731,40 +2987,54 @@ class Loop(object):
             #  Then fallback to string sort.
             try:
                 if key is None:
-                    tmp_data = sorted(self.data, key=lambda x: float(x[column]))
+                    tmp_data = sorted(self.data,
+                                      key=lambda x, pos=column: float(x[pos]))
                 else:
                     tmp_data = sorted(self.data, key=key)
             except ValueError:
                 if key is None:
-                    tmp_data = sorted(self.data, key=lambda x: x[column])
+                    tmp_data = sorted(self.data,
+                                      key=lambda x, pos=column: x[pos])
                 else:
                     tmp_data = sorted(self.data, key=key)
             self.data = tmp_data
 
-    def validate(self, validation_schema=None, category=None):
-        """Validate a loop against a STAR schema. You can pass your own
-        custom schema if desired, otherwise the schema will be fetched
-        from the BMRB servers. Returns a list of errors found. 0-length
-        list indicates no errors found."""
+    def validate(self, validate_schema=True, schema=None,
+                 validate_star=True, category=None):
+        """Validate a loop in a variety of ways. Returns a list of
+        errors found. 0-length list indicates no errors found. By
+        default all validation modes are enabled.
 
-        # Get the default schema if we are not passed a schema
-        my_schema = _get_schema(validation_schema)
+        validate_schema - Determines if the entry is validated against
+        the NMR-STAR schema. You can pass your own custom schema if desired,
+        otherwise the schema will be fetched from the BMRB servers.
+
+        validate_star - Determines if the STAR syntax checks are ran."""
 
         errors = []
 
-        # Check the data
-        for rownum, row in enumerate(self.data):
-            # Make sure the width matches
-            if len(row) != len(self.columns):
-                errors.append("Loop '%s' data width does not match it's column "
-                              "tag width on row '%d'." %
-                              (self.category, rownum))
-            for pos, datum in enumerate(row):
-                lineno = str(rownum) + " column " + str(pos) + " of loop"
-                errors.extend(my_schema.val_type(self.category + "." +
-                                                 self.columns[pos], datum,
-                                                 category=category,
-                                                 linenum=lineno))
+        if validate_schema:
+            # Get the default schema if we are not passed a schema
+            my_schema = _get_schema(schema)
+
+            # Check the data
+            for rownum, row in enumerate(self.data):
+                for pos, datum in enumerate(row):
+                    lineno = str(rownum) + " column " + str(pos) + " of loop"
+                    errors.extend(my_schema.val_type(self.category + "." +
+                                                     self.columns[pos], datum,
+                                                     category=category,
+                                                     linenum=lineno))
+
+        if validate_star:
+            # Check for wrong data size
+            num_cols = len(self.columns)
+            for rownum, row in enumerate(self.data):
+                # Make sure the width matches
+                if len(row) != num_cols:
+                    errors.append("Loop '%s' data width does not match it's "
+                                  "column tag width on row '%d'." %
+                                  (self.category, rownum))
 
         return errors
 
